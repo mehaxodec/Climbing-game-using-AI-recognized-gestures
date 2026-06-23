@@ -1,0 +1,655 @@
+import cv2
+import mediapipe as mp
+import pygame
+import math
+import random
+import os
+import time
+import numpy as np
+
+pygame.init()
+WIDTH, HEIGHT = 800, 600
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Hand Gesture Climbing Game - Optimized Dual Hand")
+clock = pygame.time.Clock()
+font = pygame.font.SysFont("Arial", 24)
+large_font = pygame.font.SysFont("Arial", 48)
+
+WHITE, BLACK = (255, 255, 255), (20, 20, 30)
+GREEN, RED, BLUE, GRAY = (50, 200, 50), (220, 50, 50), (50, 100, 250), (120, 120, 120)
+BROWN, ORANGE = (110, 70, 30), (255, 140, 0)
+SKIN_COLOR = (255, 204, 153)
+SKY_BLUE = (135, 206, 235)
+MOUNTAIN_1 = (120, 180, 120)
+MOUNTAIN_2 = (90, 150, 90)
+
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles
+
+hands = mp_hands.Hands(
+    max_num_hands=2,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7,
+    model_complexity=1
+)
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+GESTURE_HOLD = 0.5
+FLICKER_TOLERANCE = 0.25
+
+gesture_starts = {
+    "right_fist": None,
+    "right_5f": None,
+    "right_cancel": None,
+    "left_fist": None,
+    "left_2f": None,
+    "left_3f": None,
+    "left_5f": None,
+    "left_cancel": None,
+}
+gesture_gaps = {k: None for k in gesture_starts}
+
+def check_gesture_duration(gesture_key, condition):
+    now = time.time()
+    if condition:
+        gesture_gaps[gesture_key] = None
+        if gesture_starts[gesture_key] is None:
+            gesture_starts[gesture_key] = now
+        return (now - gesture_starts[gesture_key]) >= GESTURE_HOLD
+    else:
+        if gesture_starts[gesture_key] is not None:
+            if gesture_gaps[gesture_key] is None:
+                gesture_gaps[gesture_key] = now
+            elif (now - gesture_gaps[gesture_key]) > FLICKER_TOLERANCE:
+                gesture_starts[gesture_key] = None
+                gesture_gaps[gesture_key] = None
+        return False
+
+class Player:
+    def __init__(self):
+        self.x, self.y = WIDTH // 2, HEIGHT - 100
+        self.vx, self.vy = 0, 0
+        self.state = "climbing"
+        self.grabbed_ledge = None
+        self.score = 0
+        self.radius = 15
+        self.anim_timer = 0
+
+    def jump(self, dx, dy):
+        self.state = "falling"
+        self.grabbed_ledge = None
+        self.vx = max(-15, min(15, dx * 0.1))
+        self.vy = max(-22, min(-8, dy * 0.15))
+
+    def update(self, ledges, total_scroll):
+        self.anim_timer += 1
+        if self.state in ["falling", "dead_falling"]:
+            self.vy += 0.6
+            self.x += self.vx
+            self.y += self.vy
+
+            if self.x < 15:
+                self.x = 15
+                self.vx *= -0.5
+            if self.x > WIDTH - 15:
+                self.x = WIDTH - 15
+                self.vx *= -0.5
+
+            if self.vy > 0 and self.state in ["falling", "dead_falling"]:
+                for ledge in ledges:
+                    if ledge.rect.collidepoint(self.x, self.y + 20):
+                        self.state = "climbing"
+                        self.vy, self.vx = 0, 0
+                        self.y = ledge.rect.top - 20
+                        self.grabbed_ledge = ledge
+                        break
+        elif self.state == "climbing" and self.grabbed_ledge:
+            self.y = self.grabbed_ledge.rect.top - 20
+
+        if self.state != "dead_falling":
+            self.score = max(0, int(total_scroll + (HEIGHT - 100 - self.y)) // 10)
+
+    def draw(self, surface):
+        head_pos = (int(self.x), int(self.y) - 10)
+        body_start = (int(self.x), int(self.y) + 5)
+        body_end = (int(self.x), int(self.y) + 25)
+
+        if self.state == "dead_falling":
+            pygame.draw.circle(surface, RED, head_pos, 10)
+        else:
+            pygame.draw.circle(surface, SKIN_COLOR, head_pos, 10)
+            
+        pygame.draw.line(surface, BLACK, body_start, body_end, 4)
+
+        if self.state == "climbing":
+            pygame.draw.line(surface, SKIN_COLOR, body_start, (int(self.x) - 15, int(self.y) - 5), 3)
+            pygame.draw.line(surface, SKIN_COLOR, body_start, (int(self.x) + 15, int(self.y) - 5), 3)
+            pygame.draw.line(surface, BLUE, body_end, (int(self.x) - 10, int(self.y) + 40), 4)
+            pygame.draw.line(surface, BLUE, body_end, (int(self.x) + 10, int(self.y) + 40), 4)
+        else:
+            swing = math.sin(self.anim_timer * 0.3) * 10
+            if self.state == "dead_falling":
+                swing = math.sin(self.anim_timer * 0.8) * 15
+            pygame.draw.line(surface, SKIN_COLOR, body_start, (int(self.x) - 15, int(self.y) + 15 + swing), 3)
+            pygame.draw.line(surface, SKIN_COLOR, body_start, (int(self.x) + 15, int(self.y) + 15 - swing), 3)
+            pygame.draw.line(surface, BLUE, body_end, (int(self.x) - 15, int(self.y) + 35 - swing), 4)
+            pygame.draw.line(surface, BLUE, body_end, (int(self.x) + 15, int(self.y) + 35 + swing), 4)
+
+class Ledge:
+    def __init__(self, x, y, width):
+        self.rect = pygame.Rect(x, y, width, 15)
+
+    def draw(self, surface):
+        pygame.draw.rect(surface, BROWN, self.rect, border_radius=5)
+        pygame.draw.rect(surface, (160, 100, 50), (self.rect.x, self.rect.y, self.rect.width, 4), border_radius=5)
+
+class Obstacle:
+    def __init__(self, y_start):
+        self.type = random.choice(["Rock", "Rocket", "Doraemon"])
+        self.x = random.randint(50, WIDTH - 50)
+        self.y = y_start
+        self.radius = 20
+        self.vy = random.uniform(3, 6)
+        if self.type == "Rocket":
+            self.vy = 10
+
+    def update(self):
+        self.y += self.vy
+
+    def draw(self, surface):
+        if self.type == "Rock":
+            pygame.draw.circle(surface, GRAY, (int(self.x), int(self.y)), self.radius)
+            pygame.draw.circle(surface, (90, 90, 90), (int(self.x) - 5, int(self.y) - 5), 5)
+        elif self.type == "Rocket":
+            pygame.draw.rect(surface, ORANGE, (int(self.x) - 10, int(self.y) - 20, 20, 40), border_radius=8)
+            pygame.draw.polygon(surface, RED, [(self.x - 10, self.y + 20), (self.x + 10, self.y + 20), (self.x, self.y + 35)])
+        else:
+            pygame.draw.circle(surface, BLUE, (int(self.x), int(self.y)), self.radius)
+            pygame.draw.circle(surface, WHITE, (int(self.x), int(self.y) + 5), 10)
+
+class Hook:
+    def __init__(self):
+        self.active = False
+        self.x, self.y = 0, 0
+        self.vx, self.vy = 0, 0
+        self.speed = 14
+        self.returning = False
+
+    def fire(self, start_x, start_y, tx, ty):
+        if not self.active:
+            self.active = True
+            self.returning = False
+            self.x, self.y = start_x, start_y
+            angle = math.atan2(ty - start_y, tx - start_x)
+            self.vx = math.cos(angle) * self.speed
+            self.vy = math.sin(angle) * self.speed
+
+    def update(self, player, ledges, obstacles):
+        if not self.active:
+            return
+
+        if not self.returning:
+            self.x += self.vx
+            self.y += self.vy
+
+            for ledge in ledges:
+                if ledge.rect.collidepoint(self.x, self.y):
+                    if player.state != "dead_falling":
+                        player.x = ledge.rect.centerx
+                        player.y = ledge.rect.top - 20
+                        player.state = "climbing"
+                        player.grabbed_ledge = ledge
+                        player.vx, player.vy = 0, 0
+                    self.active = False
+                    return
+
+            for obs in obstacles:
+                if math.dist((self.x, self.y), (obs.x, obs.y)) < obs.radius:
+                    if player.state != "dead_falling":
+                        player.x = obs.x
+                        player.y = obs.y
+                        player.state = "dead_falling"
+                        player.vx = random.uniform(-5, 5)
+                        player.vy = -5
+                    self.active = False
+                    return
+
+            if math.dist((self.x, self.y), (player.x, player.y)) > 450:
+                self.returning = True
+        else:
+            angle = math.atan2(player.y - self.y, player.x - self.x)
+            self.x += math.cos(angle) * self.speed
+            self.y += math.sin(angle) * self.speed
+            if math.dist((self.x, self.y), (player.x, player.y)) < 25:
+                self.active = False
+
+    def draw(self, surface, px, py):
+        if self.active:
+            pygame.draw.line(surface, BLACK, (px, py), (self.x, self.y), 3)
+            pygame.draw.polygon(surface, GRAY, [(self.x, self.y), (self.x - 8, self.y + 10), (self.x + 8, self.y + 10)])
+
+def count_fingers(hand_landmarks, hand_label):
+    tips = [8, 12, 16, 20]
+    fingers = 0
+    if hand_label == "Right":
+        if hand_landmarks.landmark[4].x < hand_landmarks.landmark[2].x:
+            fingers += 1
+    else:
+        if hand_landmarks.landmark[4].x > hand_landmarks.landmark[2].x:
+            fingers += 1
+    for tip in tips:
+        if hand_landmarks.landmark[tip].y < hand_landmarks.landmark[tip - 2].y:
+            fingers += 1
+    return fingers
+
+def is_fist(hand_landmarks):
+    wrist = hand_landmarks.landmark[0]
+    for tip, mcp in [(8, 5), (12, 9), (16, 13), (20, 17)]:
+        dist_tip = math.hypot(hand_landmarks.landmark[tip].x - wrist.x, hand_landmarks.landmark[tip].y - wrist.y)
+        dist_mcp = math.hypot(hand_landmarks.landmark[mcp].x - wrist.x, hand_landmarks.landmark[mcp].y - wrist.y)
+        if dist_tip > dist_mcp * 1.4: 
+            return False
+    return True
+
+def load_highscore():
+    if os.path.exists("highscore.txt"):
+        with open("highscore.txt", "r") as f:
+            return int(f.read())
+    return 0
+
+def save_highscore(score):
+    with open("highscore.txt", "w") as f:
+        f.write(str(score))
+
+def reset_game():
+    global player, ledges, obstacles, inventory_open, equipped_item, hook, highscore, total_scroll
+    global right_aiming, right_aim_anchor, right_fist_anchor_candidate
+    global hook_aiming, hook_anchor, hook_anchor_candidate, hook_ready_for_aim
+    global gesture_starts, gesture_gaps
+
+    player = Player()
+    ledges = [Ledge(WIDTH // 2 - 50, HEIGHT - 50, 100)]
+    for i in range(1, 10):
+        ledges.append(Ledge(random.randint(50, WIDTH - 150), HEIGHT - 50 - i * 110, random.randint(80, 150)))
+    player.grabbed_ledge = ledges[0]
+    obstacles = []
+    inventory_open = False
+    equipped_item = None
+    hook = Hook()
+    highscore = load_highscore()
+    total_scroll = 0
+
+    right_aiming = False
+    right_aim_anchor = None
+    right_fist_anchor_candidate = None
+
+    hook_aiming = False
+    hook_anchor = None
+    hook_anchor_candidate = None
+    hook_ready_for_aim = False
+
+    for k in gesture_starts:
+        gesture_starts[k] = None
+        gesture_gaps[k] = None
+
+reset_game()
+game_over = False
+
+running = True
+while running:
+    clock.tick(30)
+    
+    screen.fill(SKY_BLUE)
+    
+    pygame.draw.polygon(screen, MOUNTAIN_1, [(0, HEIGHT), (200, HEIGHT - 200), (450, HEIGHT)])
+    pygame.draw.polygon(screen, MOUNTAIN_2, [(300, HEIGHT), (550, HEIGHT - 250), (WIDTH, HEIGHT)])
+    
+    pygame.draw.circle(screen, WHITE, (150, 100), 30)
+    pygame.draw.circle(screen, WHITE, (180, 110), 40)
+    pygame.draw.circle(screen, WHITE, (210, 100), 30)
+    
+    pygame.draw.circle(screen, WHITE, (600, 150), 35)
+    pygame.draw.circle(screen, WHITE, (640, 140), 45)
+    pygame.draw.circle(screen, WHITE, (680, 150), 35)
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+        if event.type == pygame.KEYDOWN and game_over:
+            if event.key == pygame.K_SPACE:
+                reset_game()
+                game_over = False
+
+    ret, frame = cap.read()
+    if not ret:
+        continue
+
+    frame = cv2.flip(frame, 1)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb)
+
+    right_hand_data = None
+    left_hand_data = None
+
+    if results.multi_hand_landmarks:
+        for hand_landmarks, hand_info in zip(results.multi_hand_landmarks, results.multi_handedness):
+            mp_drawing.draw_landmarks(
+                rgb,
+                hand_landmarks,
+                mp_hands.HAND_CONNECTIONS,
+                mp_drawing_styles.get_default_hand_landmarks_style(),
+                mp_drawing_styles.get_default_hand_connections_style())
+
+            if not game_over:
+                hand_label = hand_info.classification[0].label
+                fingers = count_fingers(hand_landmarks, hand_label)
+
+                px = int(hand_landmarks.landmark[9].x * WIDTH)
+                py = int(hand_landmarks.landmark[9].y * HEIGHT)
+
+                if hand_label == "Right":
+                    right_hand_data = {"landmarks": hand_landmarks, "fingers": fingers, "pos": (px, py)}
+                elif hand_label == "Left":
+                    left_hand_data = {"landmarks": hand_landmarks, "fingers": fingers, "pos": (px, py)}
+
+        if left_hand_data and player.state != "dead_falling" and not game_over:
+            l_fingers = left_hand_data["fingers"]
+            l_pos = left_hand_data["pos"]
+            l_landmarks = left_hand_data["landmarks"]
+
+            is_left_fist = is_fist(l_landmarks)
+            is_left_open2 = (l_fingers == 2)
+            is_left_open3 = (l_fingers == 3)
+            is_left_open5 = (l_fingers >= 4)
+
+            if is_left_fist:
+                if check_gesture_duration("left_fist", True):
+                    inventory_open = True
+                    equipped_item = None
+                    right_aiming = False
+                    right_aim_anchor = None
+                    right_fist_anchor_candidate = None
+                    hook_aiming = False
+                    hook_anchor = None
+                    hook_anchor_candidate = None
+                    hook_ready_for_aim = False
+                    check_gesture_duration("left_fist", False)
+            else:
+                check_gesture_duration("left_fist", False)
+
+            if inventory_open:
+                if equipped_item is None:
+                    if is_left_open2:
+                        if check_gesture_duration("left_2f", True):
+                            equipped_item = 1
+                    else:
+                        check_gesture_duration("left_2f", False)
+
+                    if is_left_open3:
+                        if check_gesture_duration("left_3f", True):
+                            equipped_item = 2
+                            hook_ready_for_aim = False
+                            hook_aiming = False
+                            hook_anchor = None
+                            hook_anchor_candidate = None
+                    else:
+                        check_gesture_duration("left_3f", False)
+                else:
+                    check_gesture_duration("left_2f", False)
+                    if equipped_item == 1:
+                        check_gesture_duration("left_3f", False)
+
+                    if equipped_item == 2:
+                        if not hook_aiming:
+                            if is_left_open3 and hook_ready_for_aim:
+                                if gesture_starts["left_3f"] is None:
+                                    hook_anchor_candidate = l_pos
+                                if check_gesture_duration("left_3f", True):
+                                    hook_aiming = True
+                                    hook_anchor = hook_anchor_candidate if hook_anchor_candidate is not None else l_pos
+                                    hook_ready_for_aim = False
+                            else:
+                                if not is_left_open3:
+                                    hook_ready_for_aim = True
+                                check_gesture_duration("left_3f", False)
+                        else:
+                            if is_left_open5:
+                                if check_gesture_duration("left_5f", True):
+                                    dx = l_pos[0] - hook_anchor[0]
+                                    dy = l_pos[1] - hook_anchor[1]
+                                    hook.fire(player.x, player.y, player.x + dx, player.y + dy)
+                                    hook_aiming = False
+                                    hook_anchor = None
+                                    hook_anchor_candidate = None
+                                    hook_ready_for_aim = False
+                                    check_gesture_duration("left_5f", False)
+                                    check_gesture_duration("left_cancel", False)
+                            else:
+                                check_gesture_duration("left_5f", False)
+                                if not is_left_open3:
+                                    if check_gesture_duration("left_cancel", True):
+                                        hook_aiming = False
+                                        hook_anchor = None
+                                        hook_anchor_candidate = None
+                                        hook_ready_for_aim = False
+                                        check_gesture_duration("left_cancel", False)
+                                else:
+                                    check_gesture_duration("left_cancel", False)
+
+                if not hook_aiming and equipped_item == 2 and not is_left_open3:
+                    hook_ready_for_aim = True
+
+                if not hook_aiming:
+                    check_gesture_duration("left_5f", False)
+                    check_gesture_duration("left_cancel", False)
+
+        else:
+            check_gesture_duration("left_fist", False)
+            check_gesture_duration("left_2f", False)
+            check_gesture_duration("left_3f", False)
+            check_gesture_duration("left_5f", False)
+            check_gesture_duration("left_cancel", False)
+            if equipped_item == 2 and not hook_aiming:
+                hook_ready_for_aim = True
+
+        if right_hand_data and player.state != "dead_falling" and not game_over:
+            r_fingers = right_hand_data["fingers"]
+            r_pos = right_hand_data["pos"]
+            r_landmarks = right_hand_data["landmarks"]
+
+            is_right_fist = is_fist(r_landmarks)
+            is_right_open5 = (r_fingers >= 4)
+
+            if right_aiming:
+                if is_right_open5:
+                    if check_gesture_duration("right_5f", True):
+                        dx = r_pos[0] - right_aim_anchor[0]
+                        dy = r_pos[1] - right_aim_anchor[1]
+                        player.jump(dx, dy)
+                        right_aiming = False
+                        right_aim_anchor = None
+                        right_fist_anchor_candidate = None
+                        check_gesture_duration("right_5f", False)
+                        check_gesture_duration("right_cancel", False)
+                else:
+                    check_gesture_duration("right_5f", False)
+                    if not is_right_fist:
+                        if check_gesture_duration("right_cancel", True):
+                            right_aiming = False
+                            right_aim_anchor = None
+                            right_fist_anchor_candidate = None
+                            check_gesture_duration("right_cancel", False)
+                    else:
+                        check_gesture_duration("right_cancel", False)
+            else:
+                if is_right_fist:
+                    if gesture_starts["right_fist"] is None:
+                        right_fist_anchor_candidate = r_pos
+                    if check_gesture_duration("right_fist", True):
+                        right_aiming = True
+                        right_aim_anchor = right_fist_anchor_candidate if right_fist_anchor_candidate is not None else r_pos
+                        inventory_open = False
+                        equipped_item = None
+                        hook_aiming = False
+                        hook_anchor = None
+                        hook_ready_for_aim = False
+                else:
+                    check_gesture_duration("right_fist", False)
+                    right_fist_anchor_candidate = None
+
+            if not right_aiming:
+                check_gesture_duration("right_5f", False)
+                check_gesture_duration("right_cancel", False)
+
+        else:
+            check_gesture_duration("right_fist", False)
+            check_gesture_duration("right_5f", False)
+            check_gesture_duration("right_cancel", False)
+            if right_aiming:
+                if check_gesture_duration("right_cancel", True):
+                    right_aiming = False
+                    right_aim_anchor = None
+                    right_fist_anchor_candidate = None
+                    check_gesture_duration("right_cancel", False)
+
+        if left_hand_data and player.state != "dead_falling" and not game_over:
+            lx, ly = left_hand_data["pos"]
+
+            if equipped_item == 1:
+                sword_range = 130
+                angle = math.atan2(ly - player.y, lx - player.x)
+                tip_x = player.x + math.cos(angle) * sword_range
+                tip_y = player.y + math.sin(angle) * sword_range
+
+                pygame.draw.line(screen, BLACK, (player.x, player.y), (tip_x, tip_y), 5)
+                pygame.draw.line(screen, GRAY, (player.x - 10, player.y), (player.x + 10, player.y), 3)
+                pygame.draw.circle(screen, RED, (int(tip_x), int(tip_y)), 6)
+
+                for obs in obstacles[:]:
+                    if math.dist((obs.x, obs.y), (player.x, player.y)) <= sword_range + obs.radius:
+                        obs_angle = math.atan2(obs.y - player.y, obs.x - player.x)
+                        if abs(angle - obs_angle) < 0.6:
+                            obstacles.remove(obs)
+
+            elif equipped_item == 2 and hook_aiming and hook_anchor is not None:
+                dx = lx - hook_anchor[0]
+                dy = ly - hook_anchor[1]
+                target_x = player.x + dx
+                target_y = player.y + dy
+                pygame.draw.line(screen, BLUE, (player.x, player.y), (target_x, target_y), 2)
+                pygame.draw.circle(screen, GREEN, (int(target_x), int(target_y)), 6)
+
+    if not game_over:
+        player.update(ledges, total_scroll)
+        hook.update(player, ledges, obstacles)
+
+        if player.y > HEIGHT:
+            game_over = True
+            if player.score > highscore:
+                save_highscore(player.score)
+
+        if player.y < HEIGHT // 2 and player.state == "climbing":
+            scroll_dy = (HEIGHT // 2) - player.y
+            player.y += scroll_dy
+            total_scroll += scroll_dy
+            for ledge in ledges:
+                ledge.rect.y += scroll_dy
+            for obs in obstacles:
+                obs.y += scroll_dy
+
+        ledges = [l for l in ledges if l.rect.top < HEIGHT + 50]
+        while len(ledges) < 10:
+            highest_y = min([l.rect.top for l in ledges])
+            ledges.append(Ledge(random.randint(50, WIDTH - 150), highest_y - random.randint(90, 160), random.randint(70, 130)))
+
+        if random.random() < 0.03:
+            obstacles.append(Obstacle(-50))
+
+        for obs in obstacles[:]:
+            obs.update()
+            if obs.y > HEIGHT:
+                obstacles.remove(obs)
+            elif math.dist((obs.x, obs.y), (player.x, player.y)) < (obs.radius + player.radius):
+                if player.state != "dead_falling":
+                    player.state = "dead_falling"
+                    player.vx = random.uniform(-5, 5)
+                    player.vy = random.uniform(-10, -5)
+
+    for ledge in ledges:
+        ledge.draw(screen)
+    for obs in obstacles:
+        obs.draw(screen)
+    hook.draw(screen, player.x, player.y)
+    player.draw(screen)
+
+    if right_aiming and right_aim_anchor is not None and right_hand_data and player.state != "dead_falling" and not game_over:
+        rx, ry = right_hand_data["pos"]
+        dx = rx - right_aim_anchor[0]
+        dy = ry - right_aim_anchor[1]
+        
+        sim_vx = max(-15, min(15, dx * 0.1))
+        sim_vy = max(-22, min(-8, dy * 0.15))
+        
+        aim_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        
+        sim_x, sim_y = player.x, player.y
+        curr_vy = sim_vy
+        points = [(sim_x, sim_y)]
+        for _ in range(25):
+            curr_vy += 0.6
+            sim_x += sim_vx
+            sim_y += curr_vy
+            points.append((sim_x, sim_y))
+            
+        if len(points) > 1:
+            pygame.draw.lines(aim_surface, (255, 140, 0, 120), False, points, 3)
+            
+        pygame.draw.line(aim_surface, (255, 140, 0, 180), right_aim_anchor, (rx, ry), 3)
+        pygame.draw.circle(aim_surface, (255, 0, 0, 180), right_aim_anchor, 10, 2)
+        pygame.draw.circle(aim_surface, (255, 140, 0, 180), (rx, ry), 6)
+        
+        screen.blit(aim_surface, (0, 0))
+
+    score_text = font.render(f"Score: {player.score} | High: {highscore}", True, BLACK)
+    screen.blit(score_text, (10, 10))
+
+    if right_aiming and right_aim_anchor is not None and not game_over:
+        jump_mode_txt = font.render("JUMP AIMING... (Open 5 Fingers to Jump)", True, ORANGE)
+        screen.blit(jump_mode_txt, (10, 40))
+
+    if inventory_open and player.state != "dead_falling" and not game_over:
+        pygame.draw.rect(screen, (0, 0, 0, 150), (WIDTH // 2 - 160, 5, 320, 75), border_radius=10)
+        inv_text = font.render("INVENTORY OPEN (LEFT HAND FIST)", True, GREEN)
+        screen.blit(inv_text, (WIDTH // 2 - 140, 10))
+        item_text = "None (Left 2f=Sword, 3f=Hook)"
+        if equipped_item == 1:
+            item_text = "SWORD Selected (Left Hand Aims)"
+        if equipped_item == 2:
+            if hook_aiming:
+                item_text = "HOOK AIMING... (Left 5f to Fire)"
+            else:
+                item_text = "HOOK Selected (Left 3f again to Aim)"
+        it_txt = font.render(item_text, True, ORANGE)
+        screen.blit(it_txt, (WIDTH // 2 - 140, 40))
+
+    pip_surface = pygame.surfarray.make_surface(np.swapaxes(rgb, 0, 1))
+    pip_surface = pygame.transform.scale(pip_surface, (200, 150))
+    screen.blit(pip_surface, (WIDTH - 210, HEIGHT - 160))
+    pygame.draw.rect(screen, BLACK, (WIDTH - 210, HEIGHT - 160, 200, 150), 3)
+
+    if game_over:
+        s = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        s.fill((0, 0, 0, 180))
+        screen.blit(s, (0, 0))
+        go_text = large_font.render("GAME OVER", True, RED)
+        rs_text = font.render("Press SPACE to Restart", True, WHITE)
+        screen.blit(go_text, (WIDTH // 2 - 130, HEIGHT // 2 - 50))
+        screen.blit(rs_text, (WIDTH // 2 - 110, HEIGHT // 2 + 20))
+
+    pygame.display.flip()
+
+cap.release()
+pygame.quit()
